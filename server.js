@@ -1,7 +1,11 @@
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
-const countries = require("./countries");
+// Categories the host can pick from
+const PACKS = {
+  countries: { label: "Countries", noun: "country", items: require("./countries") },
+  states: { label: "US States", noun: "state", items: require("./states") },
+};
 
 const app = express();
 const server = http.createServer(app);
@@ -9,7 +13,7 @@ const io = new Server(server);
 app.use(express.static("public"));
 
 const ROUND_MS = 5 * 60 * 1000; // 5 minutes
-const rooms = {}; // code -> { hostId, players: {socketId: name}, spies, round, deck }
+const rooms = {}; // code -> { hostId, players: {socketId: name}, spies, pack, round, deck }
 
 const newCode = () => Math.random().toString(36).slice(2, 6).toUpperCase();
 function shuffle(a) {
@@ -23,6 +27,8 @@ function sendLobby(code) {
   const r = rooms[code];
   io.to(code).emit("lobby", {
     code, hostId: r.hostId, spies: r.spies, players: Object.values(r.players),
+    pack: r.pack,
+    packs: Object.entries(PACKS).map(([key, p]) => ({ key, label: p.label })),
   });
 }
 
@@ -40,7 +46,7 @@ function revealRound(code) {
   const r = rooms[code];
   if (!r || !r.round) return;
   clearTimeout(r.round.timer);
-  io.to(code).emit("roundOver", { country: r.round.country, spies: r.round.spyNames });
+  io.to(code).emit("roundOver", { answer: r.round.answer, noun: r.round.noun, spies: r.round.spyNames });
   r.round = null;
 }
 
@@ -55,7 +61,7 @@ io.on("connection", (socket) => {
   socket.on("create", (name) => {
     let code;
     do { code = newCode(); } while (rooms[code]);
-    rooms[code] = { hostId: socket.id, players: {}, spies: 1, round: null, deck: [] };
+    rooms[code] = { hostId: socket.id, players: {}, spies: 1, pack: "countries", round: null, deck: [] };
     joinRoom(code, name);
   });
 
@@ -72,25 +78,35 @@ io.on("connection", (socket) => {
     sendLobby(socket.data.code);
   });
 
+  socket.on("setPack", (key) => {
+    const r = rooms[socket.data.code];
+    if (!r || r.hostId !== socket.id || r.round || !PACKS[key]) return;
+    r.pack = key;
+    r.deck = []; // start a fresh deck for the new category
+    sendLobby(socket.data.code);
+  });
+
   socket.on("play", () => {
     const code = socket.data.code, r = rooms[code];
     if (!r || r.hostId !== socket.id || r.round) return;
     const ids = Object.keys(r.players);
     if (r.spies >= ids.length) return socket.emit("errorMsg", "Need more players than spies");
 
-    if (!r.deck || !r.deck.length) r.deck = shuffle([...countries]);
-    const country = r.deck.pop();
+    const pack = PACKS[r.pack];
+    if (!r.deck || !r.deck.length) r.deck = shuffle([...pack.items]);
+    const item = r.deck.pop();
     const spyIds = new Set(shuffle([...ids]).slice(0, r.spies));
     r.round = {
-      country: country.name,
+      answer: item.name,
+      noun: pack.noun,
       spyNames: [...spyIds].map((id) => r.players[id]),
       ended: false,
       timer: setTimeout(() => endRound(code), ROUND_MS),
     };
     ids.forEach((id) =>
       io.to(id).emit("role", spyIds.has(id)
-        ? { spy: true, hint: country.hint, ms: ROUND_MS }
-        : { spy: false, country: country.name, ms: ROUND_MS })
+        ? { spy: true, hint: item.hint, noun: pack.noun, ms: ROUND_MS }
+        : { spy: false, answer: item.name, noun: pack.noun, ms: ROUND_MS })
     );
   });
 
